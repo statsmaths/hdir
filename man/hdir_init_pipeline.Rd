@@ -4,10 +4,12 @@
 \alias{hdir_init_pipeline}
 \title{Initialize the Pipeline of Annotations}
 \usage{
-hdir_init_pipeline(...)
+hdir_init_pipeline(annotations = c("object", "face", "pose", "embed"))
 }
 \arguments{
-\item{...}{inputs passed to the function}
+\item{annotations}{a vector of annotations to run. Possible
+options are "object", "face", "pose", and
+"embed".}
 }
 \value{
 nothing

@@ -516,12 +516,45 @@ hdir_plot_images <- function(paths, ncol = NULL, nrow = NULL)
 #' Sets up the annotations and makes sure that all of the 
 #' models are setup and working.
 #'
-#' @param ...     inputs passed to the function
+#' @param annotations     a vector of annotations to run. Possible
+#'                        options are "object", "face", "pose", and
+#'                        "embed".
 #'
 #' @returns         nothing
 #' @export
-hdir_init_pipeline <- function(...)
+hdir_init_pipeline <- function(annotations = c("object", "face", "pose", "embed"))
 {
+  # make sure that Python and dvt exist on the system and are
+  # set up correctly
+  check_python()
+
+  # determine which annotations to load
+  vol$pipeline <- list()
+  annotations <- match.arg(
+    annotations, 
+    c("object", "face", "pose", "embed"),
+    several.ok = TRUE
+  )
+
+  # load the annotations as Python objects
+  if ("object" %in% annotations)
+  {
+    vol$pipeline[['object']] <- vol$dvt$AnnoDetect()
+  }
+  if ("face" %in% annotations)
+  {
+    vol$pipeline[['face']] <- vol$dvt$AnnoFaces()
+  }
+  if ("pose" %in% annotations)
+  {
+    vol$pipeline[['pose']] <- vol$dvt$AnnoKeypoints()
+  }
+  if ("embed" %in% annotations)
+  {
+    vol$pipeline[['embed']] <- vol$dvt$AnnoEmbed()
+  }
+
+  # nothing to return
   invisible(NULL)
 }
 
@@ -529,20 +562,192 @@ hdir_init_pipeline <- function(...)
 #'
 #' Applies a set of Python libraries to the set of images.
 #'
-#' @param paths     a vector of paths to the images
-#' @param ...       inputs passed to the function
+#' @param paths       a vector of paths to the images
+#' @param fnames      an optional set of filenames to use the metadata;
+#'                    will be set to the full path names if not provided
+#' @param outdir      directory to store the output in; otherwise will 
+#'                    store in a temporary directory
+#' @param verbose     should the function report its progress; defaults
+#'                    to TRUE
+#' @param prefix      optional prefix for the output filenames
+#' @param embed_type  if running the embed annotation, what type of values
+#'                    should be returned. Either "dimred", "full", or "all".
+#'                    Defaults to "dimred" for more than 50 inputs and "full"
+#'                    otherwise. 
 #'
-#' @returns         nothing
+#' @returns           directory where the output was saved
+#'
+#' @importFrom tibble tibble
+#' @importFrom dplyr bind_rows
+#' @importFrom irlba prcomp_irlba
+#' @importFrom umap umap
+#' @importFrom FNN get.knnx
+#' @importFrom reticulate py_to_r
+#' @importFrom readr write_csv
+#'
 #' @export
-hdir_apply_pipeline <- function(paths, ...)
+hdir_apply_pipeline <- function(
+  paths,
+  fnames = paths,
+  outdir = tempdir(),
+  verbose = TRUE,
+  prefix = "",
+  embed_type = NULL
+)
 {
-  invisible(NULL)
+  # check input
+  .assert(
+    !is.null(vol$dvt),
+    "Initalize pipeline with `hdir_init_pipeline()` before running this function."
+  )
+  .assert(
+    length(paths) == length(fnames),
+    "`paths` and `fnames` do not have the same length."
+  )
+  .assert(
+    all(file.exists(paths)),
+    "some elements of `paths` do not exist."
+  )
+  if (prefix != "") { prefix <- paste0(prefix, "_", collapse = "")}
+  if (is.null(embed_type)) { embed_type <- ifelse(length(paths) < 50L, "full", "dimred") }
+  embed_type <- match.arg(embed_type, c("dimred", "full", "all"))
+  
+  # run annotations over each image
+  df_object <- vector("list", length(paths))
+  df_face <- vector("list", length(paths))
+  df_pose <- vector("list", length(paths))
+  if ('embed' %in% names(vol$pipeline))
+  {
+    mat_embed <- matrix(NA_real_, nrow = length(paths), ncol = 1280L)
+  }
+
+  df_embed <- vector("list", length(paths))
+  for (j in seq_along(paths))
+  {
+    img <- vol$dvt$load_image(paths[j])
+    idims <- dim(reticulate::py_to_r(img))
+
+    if ('object' %in% names(vol$pipeline)) {
+      obj <- vol$pipeline[['object']]$run(img)  
+      obj <- reticulate::py_to_r(obj)
+
+      if (length(obj$x))
+      {
+        df_object[[j]] <- tibble::tibble(
+          filename = fnames[j],
+          index = seq_along(obj$x) - 1L,
+          height = idims[1],
+          width = idims[2],
+          class = as.character(obj$labels),
+          prob = as.numeric(obj$scores),
+          x0 = as.integer(obj$x),
+          y0 = as.integer(obj$y),
+          x1 = as.integer(obj$xend), 
+          y1 = as.integer(obj$yend)
+        )
+      }
+    }
+
+    if ('face' %in% names(vol$pipeline)) {
+      obj <- vol$pipeline[['face']]$run(img)   
+      obj <- reticulate::py_to_r(obj)
+      if (length(obj))
+      {
+        df_face[[j]] <- tibble::tibble(
+          filename = fnames[j],
+          index = seq_along(obj$boxes$x) - 1L,
+          x0 = as.integer(obj$boxes$x),
+          y0 = as.integer(obj$boxes$y),
+          x1 = as.integer(obj$boxes$xend), 
+          y1 = as.integer(obj$boxes$yend),
+          prob = as.numeric(obj$boxes$prob),
+          height = idims[1],
+          width = idims[2]
+        )
+      }
+    }
+
+    hval <- wval <- 0
+    if ('pose' %in% names(vol$pipeline)) {
+      obj <- vol$pipeline[['pose']]$run(img)      
+      obj <- reticulate::py_to_r(obj)
+      if (length(obj$kpnt$person_id))
+      {
+        idx <- obj$kpnt$kpnt_id
+        df_pose[[j]] <- tibble::tibble(
+          filename = fnames[j],
+          index = seq_along(obj$kpnt$person_id) - 1L,
+          kpname = .knames[as.integer(idx) + 1L],
+          x = as.integer(obj$kpnt$x),
+          y = as.integer(obj$kpnt$y),
+          score = as.numeric(obj$kpnt$prob),
+          height = idims[1],
+          width = idims[2]
+        )
+      }
+    }
+    if ('embed' %in% names(vol$pipeline)) {
+      obj <- vol$pipeline[['embed']]$run(img)      
+      mat_embed[j,] <- reticulate::py_to_r(obj)[[1]]
+    }
+
+    if (verbose) cat(sprintf("Finished with %s\n", fnames[j]))
+  }
+
+  df_object <- dplyr::bind_rows(df_object)
+  df_face <- dplyr::bind_rows(df_face)
+  df_pose <- dplyr::bind_rows(df_pose)
+  
+  if (nrow(df_object))
+  {
+    readr::write_csv(df_object, file.path(outdir, sprintf("%snn_inst.csv.bz2", prefix)))
+  }
+  if (nrow(df_face))
+  {
+    readr::write_csv(df_face, file.path(outdir, sprintf("%snn_face.csv.bz2", prefix)))
+  }
+  if (nrow(df_pose))
+  {
+    readr::write_csv(df_pose, file.path(outdir, sprintf("%snn_pose.csv.bz2", prefix)))
+  }
+  if (('embed' %in% names(vol$pipeline)) & embed_type != "full") {
+    # PCA
+    X <- irlba::prcomp_irlba(t(mat_embed), n = 25L, scale. = TRUE)$rotation
+    suppressMessages({ df_pca <- tibble::as_tibble(X, .name_repair = "minimal") })
+    names(df_pca) <- sprintf("pca_%02d", seq_len(ncol(df_pca)))
+    df_pca <- bind_cols(tibble(filename = fnames), df_pca)
+    readr::write_csv(df_pca, file.path(outdir, sprintf("%sembd_pca.csv.bz2", prefix)))
+
+    # UMAP
+    df_umap <- umap::umap(mat_embed, n_components = 2L, random_state = 1L)$layout
+    suppressMessages({ df_umap <- tibble::as_tibble(df_umap, .name_repair = "minimal") })
+    names(df_umap) <- sprintf("umap_%02d", seq_len(ncol(df_umap)))
+    df_umap <- bind_cols(tibble(filename = fnames), df_umap)
+    readr::write_csv(df_umap, file.path(outdir, sprintf("%sembd_umap.csv.bz2", prefix)))
+
+    # KNN
+    nn <- min(50L, nrow(X) - 1L)
+    out <- FNN::get.knnx(X, X, k = nn + 1L)
+    df_knn <- tibble::tibble(
+      filename = rep(fnames, each = nn),
+      rank = rep(seq_len(nn), length(fnames)),
+      filename_n = fnames[as.integer(t(out$nn.index[,-1]))],
+      distance = as.numeric(t(out$nn.dist[,-1]))
+    )
+    readr::write_csv(df_knn, file.path(outdir, sprintf("%sknn.csv.bz2", prefix)))
+  }
+  if (('embed' %in% names(vol$pipeline)) & embed_type != "dimred") {
+    colnames(mat_embed) <- sprintf("embed_%04d", seq_len(ncol(mat_embed)))
+    suppressMessages({ df_embed <- tibble::as_tibble(mat_embed) })
+    df_embed <- bind_cols(tibble(filename = fnames), df_embed)
+    readr::write_csv(df_embed, file.path(outdir, sprintf("%sembd_full.csv.bz2", prefix)))
+  }
+
+  return(outdir)
 }
 
-.assert <- function(statement, msg="")
-{
-  if (!statement)
-  {
-    stop(msg, call.=(msg==""))
-  }
-}
+.knames <- c("nose", "left_eye", "right_eye", "left_ear", "right_ear",
+  "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+  "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee",
+  "right_knee", "left_ankle", "right_ankle")
+
